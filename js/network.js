@@ -33,9 +33,9 @@
     localDownloadFallback: [
       { name: 'Local Asset (1MB)', sizeMB: 1, url: './assets/test-1mb.bin' }
     ],
-    // Configurable Upload Endpoint. Set to valid URL if an echo/discard server exists.
-    // If null or empty, upload test is marked UNAVAILABLE to avoid fabricating numbers.
-    uploadEndpoint: null,
+    // Configurable Upload Endpoint with public CORS POST sink support.
+    // Uses Cloudflare Anycast Speed test upload endpoint.
+    uploadEndpoint: 'https://speed.cloudflare.com/__up',
     // Timeout bounds (in ms)
     timeout: {
       latency: 5000,

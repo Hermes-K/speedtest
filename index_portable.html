@@ -1044,12 +1044,12 @@ footer.app-footer {
           <div class="metric-header">
             <span class="metric-name">Upload Speed <button class="info-trigger" data-topic="upload">ⓘ</button></span>
             <div class="badges-wrap">
-              <span class="status-badge status-unavailable">UNAVAILABLE</span>
-              <span class="grade-badge grade-unavailable">UNAVAILABLE</span>
+              <span class="status-badge status-ready">READY</span>
+              <span class="grade-badge grade-measured">MEASURED</span>
             </div>
           </div>
-          <div class="metric-val">측정 불가</div>
-          <div class="metric-sub">원격 수신 Sink Endpoint 미구성</div>
+          <div class="metric-val">-- Mbps</div>
+          <div class="metric-sub">실제 바이너리 페이로드 POST 전송 대역폭</div>
         </div>
 
         <div class="metric-card" id="card-failrate">
@@ -1288,9 +1288,9 @@ footer.app-footer {
     localDownloadFallback: [
       { name: 'Local Asset (1MB)', sizeMB: 1, url: './assets/test-1mb.bin' }
     ],
-    // Configurable Upload Endpoint. Set to valid URL if an echo/discard server exists.
-    // If null or empty, upload test is marked UNAVAILABLE to avoid fabricating numbers.
-    uploadEndpoint: null,
+    // Configurable Upload Endpoint with public CORS POST sink support.
+    // Uses Cloudflare Anycast Speed test upload endpoint.
+    uploadEndpoint: 'https://speed.cloudflare.com/__up',
     // Timeout bounds (in ms)
     timeout: {
       latency: 5000,
@@ -2979,12 +2979,27 @@ footer.app-footer {
       }
 
       // 3. Upload Throughput
-      ui.updateMetricCard('card-upload', '측정 불가', 'UNAVAILABLE', 'UNAVAILABLE');
-      state.uploadResult = {
-        mbps: 0,
-        statusGrade: 'UNAVAILABLE',
-        reason: 'Upload 데이터를 수신할 Remote Endpoint가 구성되지 않아 정확한 측정이 불가능합니다.'
-      };
+      if (net.CONFIG.uploadEndpoint) {
+        setTestingState(true, '실제 업로드 대역폭(Throughput) 실측 중...');
+        ui.updateMetricCard('card-upload', '측정 중...', 'TESTING', 'MEASURED');
+        
+        const uploadPayloadSize = state.testMode === 'deep' ? 3 : (state.testMode === 'quick' ? 1 : 2);
+        const upload = await net.measureUploadSpeed(uploadPayloadSize);
+        state.uploadResult = upload;
+
+        if (upload.statusGrade === 'MEASURED') {
+          ui.updateMetricCard('card-upload', upload.mbps + ' Mbps', 'SUCCESS', 'MEASURED');
+        } else {
+          ui.updateMetricCard('card-upload', '오류 발생', 'FAILED', 'MEASURED');
+        }
+      } else {
+        ui.updateMetricCard('card-upload', '측정 불가', 'UNAVAILABLE', 'UNAVAILABLE');
+        state.uploadResult = {
+          mbps: 0,
+          statusGrade: 'UNAVAILABLE',
+          reason: 'Upload 데이터를 수신할 Remote Endpoint가 구성되지 않아 정확한 측정이 불가능합니다.'
+        };
+      }
 
       // 4. Update Score & Diagnostics
       recomputeScoreAndAnalysis();

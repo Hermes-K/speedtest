@@ -228,12 +228,27 @@
       }
 
       // 3. Upload Throughput
-      ui.updateMetricCard('card-upload', '측정 불가', 'UNAVAILABLE', 'UNAVAILABLE');
-      state.uploadResult = {
-        mbps: 0,
-        statusGrade: 'UNAVAILABLE',
-        reason: 'Upload 데이터를 수신할 Remote Endpoint가 구성되지 않아 정확한 측정이 불가능합니다.'
-      };
+      if (net.CONFIG.uploadEndpoint) {
+        setTestingState(true, '실제 업로드 대역폭(Throughput) 실측 중...');
+        ui.updateMetricCard('card-upload', '측정 중...', 'TESTING', 'MEASURED');
+        
+        const uploadPayloadSize = state.testMode === 'deep' ? 3 : (state.testMode === 'quick' ? 1 : 2);
+        const upload = await net.measureUploadSpeed(uploadPayloadSize);
+        state.uploadResult = upload;
+
+        if (upload.statusGrade === 'MEASURED') {
+          ui.updateMetricCard('card-upload', upload.mbps + ' Mbps', 'SUCCESS', 'MEASURED');
+        } else {
+          ui.updateMetricCard('card-upload', '오류 발생', 'FAILED', 'MEASURED');
+        }
+      } else {
+        ui.updateMetricCard('card-upload', '측정 불가', 'UNAVAILABLE', 'UNAVAILABLE');
+        state.uploadResult = {
+          mbps: 0,
+          statusGrade: 'UNAVAILABLE',
+          reason: 'Upload 데이터를 수신할 Remote Endpoint가 구성되지 않아 정확한 측정이 불가능합니다.'
+        };
+      }
 
       // 4. Update Score & Diagnostics
       recomputeScoreAndAnalysis();
