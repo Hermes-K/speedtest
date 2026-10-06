@@ -232,8 +232,9 @@
         setTestingState(true, '실제 업로드 대역폭(Throughput) 실측 중...');
         ui.updateMetricCard('card-upload', '측정 중...', 'TESTING', 'MEASURED');
         
-        const uploadPayloadSize = state.testMode === 'deep' ? 3 : (state.testMode === 'quick' ? 1 : 2);
-        const upload = await net.measureUploadSpeed(uploadPayloadSize);
+        const upload = await net.measureUploadSpeed(2, (sent, total, currMbps) => {
+          ui.updateMetricCard('card-upload', currMbps + ' Mbps', 'TESTING', 'MEASURED');
+        });
         state.uploadResult = upload;
 
         if (upload.statusGrade === 'MEASURED') {

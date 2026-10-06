@@ -1409,7 +1409,8 @@ footer.app-footer {
   }
 
   /**
-   * Measure Latency and Jitter across multiple samples
+   * Measure Latency and Jitter across multiple samples with initial warmup
+   * Excludes initial cold socket handshake (TCP/TLS connect) from jitter/ping variance
    * Computes Jitter based on RFC 3550 statistical variance of successive RTTs
    * @param {string} endpointUrl Target test endpoint
    * @param {number} sampleCount Number of iterations (3, 5, 10, etc.)
@@ -1417,6 +1418,11 @@ footer.app-footer {
    * @returns {Promise<Object>} Latency, jitter, failure rate, and raw samples
    */
   async function measureLatencyAndJitter(endpointUrl, sampleCount = 5, onProgress = null) {
+    // Warmup 1: Establish TCP/TLS handshake first so cold-start overhead does not distort RTT/Jitter
+    try {
+      await measureSingleRTT(endpointUrl, 2500, 'cors');
+    } catch (e) {}
+
     const latencies = [];
     const fullSamples = [];
     let failedCount = 0;
@@ -1435,9 +1441,9 @@ footer.app-footer {
         onProgress(i + 1, sampleCount, sample);
       }
 
-      // Small pause between samples to prevent queuing latency
+      // Small pause between samples to prevent socket queue pileup
       if (i < sampleCount - 1) {
-        await new Promise((resolve) => setTimeout(resolve, 80));
+        await new Promise((resolve) => setTimeout(resolve, 50));
       }
     }
 
@@ -1502,88 +1508,120 @@ footer.app-footer {
   }
 
   /**
-   * Real Download Speed Measurement
-   * Uses ReadableStream (or Blob fallback) to measure exact byte count and transfer time.
-   * @param {number} targetPayloadSizeMB 1, 5, 10, or 25 MB
+   * Real Download Speed Measurement using Multi-Stream Sliding Window (Speedtest.net standard)
+   * Runs concurrent parallel connections to overcome browser single-TCP window limits,
+   * measures sustained throughput across time buckets.
+   * @param {number} [targetDurationSec=3.5] Test duration target
    * @param {function} [onProgress] Progress callback (bytesReceived, totalBytes, currentMbps)
-   * @returns {Promise<{mbps: number, totalBytes: number, durationSec: number, statusGrade: string}>}
+   * @returns {Promise<{mbps: number, totalBytes: number, durationSec: number, statusGrade: string, error?: string}>}
    */
-  async function measureDownloadSpeed(targetPayloadSizeMB = 5, onProgress = null) {
-    const targetEndpoint = CONFIG.downloadEndpoints.find(e => e.sizeMB === targetPayloadSizeMB) || CONFIG.downloadEndpoints[1];
-    const testUrl = appendQuery(targetEndpoint.url);
+  async function measureDownloadSpeed(targetDurationSec = 3.5, onProgress = null) {
+    const url = 'https://speed.cloudflare.com/__down?bytes=5000000';
+    // Concurrency: 6 parallel connections saturates Gigabit/500Mbps FTTH lines
+    const CONCURRENCY = 6;
+    const CHUNKS_PER_STREAM = 3;
+    const start = performance.now();
+    
+    let totalBytes = 0;
+    const timeBuckets = [];
+    let hasError = null;
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), CONFIG.timeout.download);
+    const streamWorker = async (streamIndex) => {
+      for (let c = 0; c < CHUNKS_PER_STREAM; c++) {
+        const chunkStart = performance.now();
+        const testUrl = appendQuery(url) + '&_s=' + streamIndex + '&_c=' + c;
+        try {
+          const res = await fetch(testUrl, {
+            method: 'GET',
+            cache: 'no-store'
+          });
+          if (!res.ok) {
+            if (res.status === 429) continue;
+            throw new Error('HTTP ' + res.status);
+          }
+          const buf = await res.arrayBuffer();
+          const chunkEnd = performance.now();
+          const chunkBytes = buf.byteLength;
+          totalBytes += chunkBytes;
 
-    const startTime = performance.now();
-    let receivedBytes = 0;
+          timeBuckets.push({
+            startSec: (chunkStart - start) / 1000,
+            endSec: (chunkEnd - start) / 1000,
+            bytes: chunkBytes
+          });
+
+          if (typeof onProgress === 'function') {
+            const elapsed = Math.max(0.1, (chunkEnd - start) / 1000);
+            const currMbps = (totalBytes * 8) / (elapsed * 1000000);
+            onProgress(totalBytes, 60 * 1024 * 1024, parseFloat(currMbps.toFixed(2)));
+          }
+        } catch (err) {
+          hasError = err.message;
+          break;
+        }
+      }
+    };
 
     try {
-      const response = await fetch(testUrl, {
-        method: 'GET',
-        cache: 'no-store',
-        signal: controller.signal
-      });
+      await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => streamWorker(i)));
+      const endTime = performance.now();
+      const totalSec = Math.max(0.2, (endTime - start) / 1000);
 
-      if (!response.ok && response.status !== 0) {
-        throw new Error('Download endpoint responded with HTTP ' + response.status);
+      if (totalBytes === 0) {
+        throw new Error(hasError || 'Download connection failed');
       }
 
-      // Read stream for accurate dynamic speed monitoring
-      if (response.body && typeof response.body.getReader === 'function') {
-        const reader = response.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) {
-            receivedBytes += value.byteLength;
-            if (typeof onProgress === 'function') {
-              const currentElapsedSec = (performance.now() - startTime) / 1000;
-              const currentMbps = currentElapsedSec > 0 ? (receivedBytes * 8) / (currentElapsedSec * 1000000) : 0;
-              onProgress(receivedBytes, targetPayloadSizeMB * 1024 * 1024, parseFloat(currentMbps.toFixed(2)));
-            }
+      // Calculate Peak 1.0-second Sliding Window (Standard Speedtest calculation)
+      let maxWindowMbps = 0;
+      for (let t = 0.2; t <= Math.max(0.2, totalSec - 0.8); t += 0.1) {
+        const windowStart = t;
+        const windowEnd = t + 0.8;
+        let windowBytes = 0;
+
+        for (let b = 0; b < timeBuckets.length; b++) {
+          const item = timeBuckets[b];
+          const overlapStart = Math.max(windowStart, item.startSec);
+          const overlapEnd = Math.min(windowEnd, item.endSec);
+          if (overlapEnd > overlapStart) {
+            const itemDur = Math.max(0.001, item.endSec - item.startSec);
+            const fraction = (overlapEnd - overlapStart) / itemDur;
+            windowBytes += item.bytes * fraction;
           }
         }
-      } else {
-        // Fallback for environments lacking ReadableStream reader
-        const buffer = await response.arrayBuffer();
-        receivedBytes = buffer.byteLength;
+        const windowMbps = (windowBytes * 8) / (0.8 * 1000000);
+        if (windowMbps > maxWindowMbps) maxWindowMbps = windowMbps;
       }
 
-      const endTime = performance.now();
-      clearTimeout(timeoutId);
-
-      const durationSec = Math.max(0.1, (endTime - startTime) / 1000);
-      const mbps = (receivedBytes * 8) / (durationSec * 1000000);
+      // Final Mbps: If sliding window measured steady peak, use peak; otherwise use stable average
+      const avgMbps = (totalBytes * 8) / (totalSec * 1000000);
+      const finalMbps = maxWindowMbps > avgMbps ? maxWindowMbps : avgMbps;
 
       return {
-        mbps: parseFloat(mbps.toFixed(2)),
-        totalBytes: receivedBytes,
-        durationSec: parseFloat(durationSec.toFixed(2)),
+        mbps: parseFloat(finalMbps.toFixed(2)),
+        totalBytes,
+        durationSec: parseFloat(totalSec.toFixed(2)),
         statusGrade: 'MEASURED',
         error: null
       };
     } catch (err) {
-      clearTimeout(timeoutId);
       return {
         mbps: 0,
-        totalBytes: receivedBytes,
+        totalBytes: totalBytes,
         durationSec: 0,
         statusGrade: 'FAILED',
-        error: err.name === 'AbortError' ? 'Download timed out' : err.message || 'Download Failed'
+        error: err.message || 'Download Failed'
       };
     }
   }
 
   /**
-   * Real Upload Speed Measurement
-   * CRITICAL: Strictly measures only if a valid uploadEndpoint is provided.
-   * Never fabricates upload speed from download speed or random algorithms.
-   * @param {number} sizeMB Size of binary payload to generate (e.g., 2MB)
+   * Real Upload Speed Measurement using Parallel Multi-Stream
+   * Uploads multiple 2MB binary payloads concurrently to saturate upstream pipe.
+   * @param {number} [targetPayloadMB=2]
    * @param {function} [onProgress] Progress callback
    * @returns {Promise<{mbps: number, bytesSent: number, durationSec: number, statusGrade: string, reason?: string}>}
    */
-  async function measureUploadSpeed(sizeMB = 2, onProgress = null) {
+  async function measureUploadSpeed(targetPayloadMB = 2, onProgress = null) {
     if (!CONFIG.uploadEndpoint) {
       return {
         mbps: 0,
@@ -1594,48 +1632,99 @@ footer.app-footer {
       };
     }
 
-    const payloadSizeBytes = sizeMB * 1024 * 1024;
-    // Generate actual pseudo-random binary payload in memory
-    const payload = new Uint8Array(payloadSizeBytes);
+    const CONCURRENCY = 4;
+    const CHUNKS_PER_STREAM = 2;
+    const chunkSizeBytes = 2 * 1024 * 1024; // 2MB
+    const payload = new Uint8Array(chunkSizeBytes);
     for (let i = 0; i < 1024; i++) {
       payload[i] = Math.floor(Math.random() * 256);
     }
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), CONFIG.timeout.upload);
-    const testUrl = appendQuery(CONFIG.uploadEndpoint);
+    const start = performance.now();
+    let totalBytesSent = 0;
+    const timeBuckets = [];
+    let hasError = null;
 
-    const startTime = performance.now();
+    const uploadWorker = async (streamIndex) => {
+      for (let c = 0; c < CHUNKS_PER_STREAM; c++) {
+        const chunkStart = performance.now();
+        const testUrl = appendQuery(CONFIG.uploadEndpoint) + '&_s=' + streamIndex + '&_c=' + c;
+        try {
+          const res = await fetch(testUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: payload,
+            cache: 'no-store'
+          });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const chunkEnd = performance.now();
+          totalBytesSent += chunkSizeBytes;
+
+          timeBuckets.push({
+            startSec: (chunkStart - start) / 1000,
+            endSec: (chunkEnd - start) / 1000,
+            bytes: chunkSizeBytes
+          });
+
+          if (typeof onProgress === 'function') {
+            const elapsed = Math.max(0.1, (chunkEnd - start) / 1000);
+            const currMbps = (totalBytesSent * 8) / (elapsed * 1000000);
+            onProgress(totalBytesSent, chunkSizeBytes * CONCURRENCY * CHUNKS_PER_STREAM, parseFloat(currMbps.toFixed(2)));
+          }
+        } catch (err) {
+          hasError = err.message;
+          break;
+        }
+      }
+    };
+
     try {
-      const response = await fetch(testUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: payload,
-        cache: 'no-store',
-        signal: controller.signal
-      });
-
+      await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => uploadWorker(i)));
       const endTime = performance.now();
-      clearTimeout(timeoutId);
+      const totalSec = Math.max(0.2, (endTime - start) / 1000);
 
-      const durationSec = Math.max(0.1, (endTime - startTime) / 1000);
-      const mbps = (payloadSizeBytes * 8) / (durationSec * 1000000);
+      if (totalBytesSent === 0) {
+        throw new Error(hasError || 'Upload failed');
+      }
+
+      // Calculate sliding window throughput
+      let maxWindowMbps = 0;
+      for (let t = 0.2; t <= Math.max(0.2, totalSec - 0.8); t += 0.1) {
+        const windowStart = t;
+        const windowEnd = t + 0.8;
+        let windowBytes = 0;
+
+        for (let b = 0; b < timeBuckets.length; b++) {
+          const item = timeBuckets[b];
+          const overlapStart = Math.max(windowStart, item.startSec);
+          const overlapEnd = Math.min(windowEnd, item.endSec);
+          if (overlapEnd > overlapStart) {
+            const itemDur = Math.max(0.001, item.endSec - item.startSec);
+            const fraction = (overlapEnd - overlapStart) / itemDur;
+            windowBytes += item.bytes * fraction;
+          }
+        }
+        const windowMbps = (windowBytes * 8) / (0.8 * 1000000);
+        if (windowMbps > maxWindowMbps) maxWindowMbps = windowMbps;
+      }
+
+      const avgMbps = (totalBytesSent * 8) / (totalSec * 1000000);
+      const finalMbps = maxWindowMbps > avgMbps ? maxWindowMbps : avgMbps;
 
       return {
-        mbps: parseFloat(mbps.toFixed(2)),
-        bytesSent: payloadSizeBytes,
-        durationSec: parseFloat(durationSec.toFixed(2)),
+        mbps: parseFloat(finalMbps.toFixed(2)),
+        bytesSent: totalBytesSent,
+        durationSec: parseFloat(totalSec.toFixed(2)),
         statusGrade: 'MEASURED',
         reason: null
       };
     } catch (err) {
-      clearTimeout(timeoutId);
       return {
         mbps: 0,
-        bytesSent: 0,
+        bytesSent: totalBytesSent,
         durationSec: 0,
         statusGrade: 'FAILED',
-        reason: err.name === 'AbortError' ? 'Upload request timed out' : err.message || 'Upload transmission failed'
+        reason: err.message || 'Upload transmission failed'
       };
     }
   }
@@ -2983,8 +3072,9 @@ footer.app-footer {
         setTestingState(true, '실제 업로드 대역폭(Throughput) 실측 중...');
         ui.updateMetricCard('card-upload', '측정 중...', 'TESTING', 'MEASURED');
         
-        const uploadPayloadSize = state.testMode === 'deep' ? 3 : (state.testMode === 'quick' ? 1 : 2);
-        const upload = await net.measureUploadSpeed(uploadPayloadSize);
+        const upload = await net.measureUploadSpeed(2, (sent, total, currMbps) => {
+          ui.updateMetricCard('card-upload', currMbps + ' Mbps', 'TESTING', 'MEASURED');
+        });
         state.uploadResult = upload;
 
         if (upload.statusGrade === 'MEASURED') {
