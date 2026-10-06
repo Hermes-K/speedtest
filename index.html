@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Network Quality Analyzer — 전문 네트워크 품질 및 원인 진단기</title>
+  <meta name="description" content="네트워크 엔지니어용 초정밀 인터넷 속도 측정 및 웹사이트 접속 품질/원인 진단 도구 (Latency, Jitter, TTFB, Throughput, TAO 분석)">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- App Header -->
+  <header class="app-header">
+    <div class="logo-group">
+      <span class="logo-icon">⚡</span>
+      <div>
+        <h1 class="app-title">Network Quality Analyzer</h1>
+      </div>
+      <span class="app-badge">v2.5 PRO</span>
+    </div>
+    <div class="header-status">
+      <div class="status-online">
+        <span class="status-dot"></span>
+        <span id="connection-status-text">ONLINE</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Global Progress Bar -->
+  <div id="global-test-status">
+    <div class="spinner"></div>
+    <span class="status-text">진단 준비 중...</span>
+  </div>
+
+  <!-- Local file:// Warning Banner -->
+  <div id="env-warning-banner" class="env-warning"></div>
+
+  <!-- Top Navigation Tabs -->
+  <nav class="app-nav">
+    <button class="nav-tab active" data-tab="tab-overview" id="nav-overview">Overview</button>
+    <button class="nav-tab" data-tab="tab-speed" id="nav-speed">Speed Test</button>
+    <button class="nav-tab" data-tab="tab-website" id="nav-website">Website Test</button>
+    <button class="nav-tab" data-tab="tab-advanced" id="nav-advanced">Advanced</button>
+    <button class="nav-tab" data-tab="tab-report" id="nav-report">Report</button>
+  </nav>
+
+  <!-- Main Work Area -->
+  <main class="app-main">
+
+    <!-- TAB 1: OVERVIEW -->
+    <section id="tab-overview" class="tab-content active">
+      <!-- Universal Control Bar -->
+      <div class="control-bar">
+        <div class="control-group">
+          <span style="font-size: 0.85rem; color: var(--text-muted); font-weight: 600;">측정 정밀도:</span>
+          <div class="btn-group">
+            <button class="mode-btn" data-mode="quick">Quick (3회)</button>
+            <button class="mode-btn active" data-mode="standard">Standard (5회)</button>
+            <button class="mode-btn" data-mode="deep">Deep (10회)</button>
+          </div>
+          <span id="traffic-notice" style="font-size: 0.75rem; color: var(--text-dim); margin-left: 0.5rem;">
+            예상 데이터 사용량: 약 10~15MB (권장 표준 5회 샘플 점검)
+          </span>
+        </div>
+        <button id="btn-start-comprehensive" class="btn-primary action-trigger">전체 종합 정밀 진단 시작</button>
+      </div>
+
+      <!-- Top Primary Metrics Cards -->
+      <div class="metrics-grid">
+        <div class="metric-card" id="card-ping">
+          <div class="metric-header">
+            <span class="metric-name">HTTP Latency (RTT) <button class="info-trigger" data-topic="ping">ⓘ</button></span>
+            <div class="badges-wrap">
+              <span class="status-badge status-ready">READY</span>
+              <span class="grade-badge grade-measured">MEASURED</span>
+            </div>
+          </div>
+          <div class="metric-val">-- ms</div>
+          <div class="metric-sub">Anycast CDN 중간값 (Median)</div>
+        </div>
+
+        <div class="metric-card" id="card-jitter">
+          <div class="metric-header">
+            <span class="metric-name">Jitter (지터 편차) <button class="info-trigger" data-topic="jitter">ⓘ</button></span>
+            <div class="badges-wrap">
+              <span class="status-badge status-ready">READY</span>
+              <span class="grade-badge grade-measured">MEASURED</span>
+            </div>
+          </div>
+          <div class="metric-val">-- ms</div>
+          <div class="metric-sub">RFC 3550 연속 지연 편차</div>
+        </div>
+
+        <div class="metric-card" id="card-download">
+          <div class="metric-header">
+            <span class="metric-name">Download Speed <button class="info-trigger" data-topic="download">ⓘ</button></span>
+            <div class="badges-wrap">
+              <span class="status-badge status-ready">READY</span>
+              <span class="grade-badge grade-measured">MEASURED</span>
+            </div>
+          </div>
+          <div class="metric-val">-- Mbps</div>
+          <div class="metric-sub">실제 바이너리 페이로드 실측 대역폭</div>
+        </div>
+
+        <div class="metric-card" id="card-upload">
+          <div class="metric-header">
+            <span class="metric-name">Upload Speed <button class="info-trigger" data-topic="upload">ⓘ</button></span>
+            <div class="badges-wrap">
+              <span class="status-badge status-unavailable">UNAVAILABLE</span>
+              <span class="grade-badge grade-unavailable">UNAVAILABLE</span>
+            </div>
+          </div>
+          <div class="metric-val">측정 불가</div>
+          <div class="metric-sub">원격 수신 Sink Endpoint 미구성</div>
+        </div>
+
+        <div class="metric-card" id="card-failrate">
+          <div class="metric-header">
+            <span class="metric-name">Request Failure <button class="info-trigger" data-topic="failureRate">ⓘ</button></span>
+            <div class="badges-wrap">
+              <span class="status-badge status-ready">READY</span>
+              <span class="grade-badge grade-measured">MEASURED</span>
+            </div>
+          </div>
+          <div class="metric-val">0.0 %</div>
+          <div class="metric-sub">HTTP 요청 단절 및 타임아웃 비율</div>
+        </div>
+      </div>
+
+      <!-- Dial Score & Realtime Line Chart Grid -->
+      <div class="overview-middle">
+        <div class="score-panel">
+          <span style="font-size: 0.85rem; color: var(--text-muted); font-weight: 700;">NETWORK QUALITY SCORE</span>
+          <div class="score-dial">
+            <svg class="dial-svg" viewBox="0 0 120 120">
+              <circle class="dial-bg" cx="60" cy="60" r="54"></circle>
+              <circle id="score-ring-circle" class="dial-bar" cx="60" cy="60" r="54"></circle>
+            </svg>
+            <div class="score-center-text">
+              <span id="score-number" class="score-num">--</span>
+              <span class="score-denom">/ 100</span>
+            </div>
+          </div>
+          <div id="score-grade" class="score-grade-text color-blue">진단 전 대기중</div>
+          <div class="subscores-list">
+            <div id="subscore-latency"></div>
+            <div id="subscore-stability"></div>
+            <div id="subscore-download"></div>
+            <div id="subscore-website"></div>
+          </div>
+        </div>
+
+        <div class="chart-panel">
+          <div class="section-header">
+            <span class="section-title">Latency Timeline (Realtime HTTP RTT)</span>
+            <span style="font-size: 0.75rem; color: var(--text-dim);">순수 브라우저 인라인 SVG 렌더링</span>
+          </div>
+          <div id="speed-latency-chart" class="chart-box">
+            <div class="chart-empty">상단의 진단 시작 버튼을 누르면 실시간 Latency 변화 곡선이 표시됩니다.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Root-Cause Diagnostic Output Panel -->
+      <div class="diag-panel">
+        <div class="section-header">
+          <span class="section-title">엔지니어 진단 엔진 추론 결과 (Diagnostic Engine Verdict)</span>
+          <span class="grade-badge grade-inferred">RULE-BASED INFERRED</span>
+        </div>
+        <div id="diagnostic-output">
+          <div style="color: var(--text-dim); font-size: 0.85rem; text-align: center; padding: 2rem 0;">
+            진단이 완료되면 '사용자 로컬 네트워크 원인'인지 '특정 웹서버 백엔드 원인'인지 상세 분석 보고서가 제공됩니다.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 2: SPEED TEST -->
+    <section id="tab-speed" class="tab-content">
+      <div class="control-bar">
+        <div>
+          <h2 style="font-size: 1.1rem; color: #fff; margin-bottom: 0.2rem;">인터넷 회선 전용 속도 및 패킷 안정성 검사</h2>
+          <p style="font-size: 0.8rem; color: var(--text-dim);">글로벌 Anycast CDN 엔드포인트를 대상으로 순수 회선 Throughput 및 RTT를 평가합니다.</p>
+        </div>
+        <button id="btn-start-speedtest" class="btn-primary action-trigger">속도 측정 단독 실행</button>
+      </div>
+
+      <div class="chart-panel" style="margin-top: 1rem;">
+        <span class="section-title" style="margin-bottom: 1rem;">다운로드 대역폭 실측 및 버퍼링 상태</span>
+        <div style="background: #020617; border-radius: 8px; padding: 1.5rem; border: 1px solid var(--border-color); font-size: 0.85rem; color: var(--text-muted);">
+          <p>• <strong>측정 방식:</strong> Cloudflare Global Speed CDN 엔드포인트에서 <code>cache: "no-store"</code> 헤더와 동적 유니크 쿼리스트링을 부여한 바이너리 스트림을 실시간 수신하여 대역폭(Mbps)을 계산합니다.</p>
+          <p style="margin-top: 0.5rem;">• <strong>업로드 속도 정책:</strong> 원격 서버에 데이터를 POST 수신해줄 백엔드가 존재하지 않는 순수 정적 브라우저 환경에서는 가짜 속도를 절대 생성하지 않으며 <code>UNAVAILABLE</code> 상태로 안전하게 표시합니다.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: WEBSITE QUALITY TEST -->
+    <section id="tab-website" class="tab-content">
+      <div class="control-bar">
+        <div class="url-input-wrap">
+          <input type="text" id="target-url-input" class="url-input" placeholder="진단할 대상 웹사이트 입력 (예: naver.com, github.com)" value="https://github.com">
+          <button id="btn-start-target-test" class="btn-primary action-trigger">웹사이트 진단</button>
+        </div>
+      </div>
+
+      <!-- Target Metrics Cards -->
+      <div class="metrics-grid">
+        <div class="metric-card" id="card-target-resp">
+          <div class="metric-header">
+            <span class="metric-name">Target Response (RTT)</span>
+            <div class="badges-wrap">
+              <span class="status-badge status-ready">READY</span>
+              <span class="grade-badge grade-measured">MEASURED</span>
+            </div>
+          </div>
+          <div class="metric-val">-- ms</div>
+          <div class="metric-sub">웹사이트 왕복 HTTP 소요시간</div>
+        </div>
+
+        <div class="metric-card" id="card-target-ttfb">
+          <div class="metric-header">
+            <span class="metric-name">Target TTFB <button class="info-trigger" data-topic="ttfb">ⓘ</button></span>
+            <div class="badges-wrap">
+              <span class="status-badge status-ready">READY</span>
+              <span class="grade-badge grade-estimated">ESTIMATED</span>
+            </div>
+          </div>
+          <div class="metric-val">-- ms</div>
+          <div class="metric-sub">서버 최초 1바이트 응답 대기시간</div>
+        </div>
+      </div>
+
+      <!-- Baseline vs Target Comparison View -->
+      <div id="comparison-view"></div>
+
+      <!-- Waterfall Timeline Visualization -->
+      <div class="waterfall-panel">
+        <div class="section-header">
+          <span class="section-title">Resource Timing Waterfall (DNS / TCP / TLS / TTFB / Content)</span>
+          <button class="info-trigger" data-topic="tao">ⓘ TAO 보안 제약 안내</button>
+        </div>
+        <div id="waterfall-view">
+          <div class="chart-empty">웹사이트 검사를 시작하면 세부 네트워크 페이즈 분석이 표시됩니다.</div>
+        </div>
+      </div>
+
+      <!-- Target Latency Variation Chart -->
+      <div class="chart-panel">
+        <span class="section-title" style="margin-bottom: 0.75rem;">반복 요청 안정성 편차 (Target Latency Samples)</span>
+        <div id="target-latency-chart" class="chart-box">
+          <div class="chart-empty">반복 테스트 데이터가 준비되지 않았습니다.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: ADVANCED (FOR NETWORK ENGINEERS) -->
+    <section id="tab-advanced" class="tab-content">
+      <div class="section-header">
+        <span class="section-title">Network Engineer Diagnostics & Environment Specs</span>
+      </div>
+      <div id="advanced-specs"></div>
+      
+      <div class="diag-panel" style="margin-top: 1.5rem;">
+        <span class="section-title" style="margin-bottom: 0.75rem;">측정 등급 (Status Grade) 정의 명세서</span>
+        <ul style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.8; list-style: none;">
+          <li><span class="grade-badge grade-measured">MEASURED</span> 브라우저 fetch() 및 Performance API를 통해 직접 정밀 실측된 값</li>
+          <li><span class="grade-badge grade-estimated">ESTIMATED</span> 브라우저 내부 휴리스틱 또는 Network Information API를 활용한 추정값</li>
+          <li><span class="grade-badge grade-inferred">INFERRED</span> 복수의 통계 샘플 및 기준선(Baseline) 대비 편차를 알고리즘으로 추론한 판정</li>
+          <li><span class="grade-badge grade-unavailable">UNAVAILABLE</span> 브라우저 보안 샌드박스 정책(CORS/Raw Socket 부재)상 임의 생성할 수 없는 항목</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- TAB 5: REPORT & EXPORT -->
+    <section id="tab-report" class="tab-content">
+      <div class="section-header">
+        <span class="section-title">네트워크 품질 분석 리포트 (Engineering Report)</span>
+      </div>
+      <div class="report-actions">
+        <button id="btn-copy-report" class="btn-secondary">텍스트 복사</button>
+        <button id="btn-download-txt" class="btn-secondary">TXT 저장</button>
+        <button id="btn-download-json" class="btn-secondary">JSON 내보내기</button>
+        <button id="btn-download-csv" class="btn-secondary">CSV 내보내기</button>
+        <button id="btn-print-report" class="btn-secondary">PDF/프린트 인쇄</button>
+      </div>
+
+      <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; padding: 1.5rem;">
+        <pre id="text-report-preview" style="font-family: monospace; font-size: 0.8rem; color: var(--text-muted); white-space: pre-wrap; line-height: 1.5;">진단 완료 후 여기에 엔지니어링 텍스트 리포트가 실시간 생성됩니다.</pre>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Interactive Info Modal Dialog -->
+  <div id="explanation-modal" class="modal-overlay">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="modal-title" class="modal-title">용어 설명</h3>
+        <button id="modal-close-btn" class="modal-close">✕</button>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Footer & Privacy Notice -->
+  <footer class="app-footer">
+    <div class="privacy-notice">
+      <h5>🔒 개인정보 및 보안 준수 서약 (Privacy Policy)</h5>
+      <p>• 본 WebApp의 모든 측정, 통계 계산, 그래프 생성, 원인 판정은 <strong>100% 사용자의 현재 웹 브라우저 내부(Client-Side)</strong>에서만 수행됩니다.</p>
+      <p>• 사용자가 입력한 웹사이트 URL이나 진단 결과는 어떠한 외부 Analytics 서버, 트래킹 서버, 원격 데이터베이스로도 전송되거나 저장되지 않습니다.</p>
+      <p>• 단, 실제 네트워크 속도 및 웹사이트 도달성을 측정하기 위해 선택된 글로벌 CDN 및 사용자가 지정한 대상 웹사이트와 직접 순수 HTTP 통신을 수행합니다.</p>
+    </div>
+    <div>Network Quality Analyzer © 2026. Designed for Network & Performance Engineers.</div>
+  </footer>
+
+  <!-- Scripts Loading (Vanilla JavaScript Module Order) -->
+  <script src="js/network.js"></script>
+  <script src="js/analyzer.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/app.js"></script>
+
+</body>
+</html>

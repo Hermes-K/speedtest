@@ -1,0 +1,637 @@
+/**
+ * network.js - Network Quality Analyzer Core Measurement Engine
+ * 
+ * Provides robust client-side network measurement functions:
+ * - Multi-sample HTTP latency (RTT) & Jitter calculation (RFC 3550 standard)
+ * - HTTP Request Failure rate calculation
+ * - Download throughput (Mbps) using actual chunked payload transfer
+ * - Upload throughput (Mbps) via actual payload POST (if upload endpoint is provided)
+ * - Target website multi-tier diagnostic fetching
+ * - PerformanceResourceTiming analysis (DNS, TCP, TLS, TTFB, Download)
+ * - Cross-Origin and Timing-Allow-Origin detection
+ */
+
+(function (window) {
+  'use strict';
+
+  // Global Configuration & Constants
+  const CONFIG = {
+    // Highly available global Anycast CDN endpoints for baseline latency & jitter testing
+    baselineEndpoints: [
+      { name: 'Cloudflare Edge', url: 'https://1.1.1.1/cdn-cgi/trace', label: 'CF 1.1.1.1' },
+      { name: 'Cloudflare CDN', url: 'https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/js/bootstrap.min.js', label: 'CF cdnjs' },
+      { name: 'Google Hosted Edge', url: 'https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js', label: 'Google CDN' }
+    ],
+    // Download test files (direct CDNs with permissive CORS)
+    downloadEndpoints: [
+      { name: 'Fastly CDN (1MB)', sizeMB: 1, url: 'https://speed.cloudflare.com/__down?bytes=1048576' },
+      { name: 'Cloudflare Speed (5MB)', sizeMB: 5, url: 'https://speed.cloudflare.com/__down?bytes=5242880' },
+      { name: 'Cloudflare Speed (10MB)', sizeMB: 10, url: 'https://speed.cloudflare.com/__down?bytes=10485760' },
+      { name: 'Cloudflare Speed (25MB)', sizeMB: 25, url: 'https://speed.cloudflare.com/__down?bytes=26214400' }
+    ],
+    // Fallback local relative path if hosted on GitHub Pages
+    localDownloadFallback: [
+      { name: 'Local Asset (1MB)', sizeMB: 1, url: './assets/test-1mb.bin' }
+    ],
+    // Configurable Upload Endpoint. Set to valid URL if an echo/discard server exists.
+    // If null or empty, upload test is marked UNAVAILABLE to avoid fabricating numbers.
+    uploadEndpoint: null,
+    // Timeout bounds (in ms)
+    timeout: {
+      latency: 5000,
+      download: 25000,
+      upload: 25000,
+      targetTest: 8000
+    }
+  };
+
+  /**
+   * Helper: Generate a unique cache-busting query parameter
+   * @returns {string}
+   */
+  function getCacheBuster() {
+    return '_nqa_ts=' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+  }
+
+  /**
+   * Helper: Appends cache-buster to URL correctly
+   * @param {string} url 
+   * @returns {string}
+   */
+  function appendQuery(url) {
+    const separator = url.indexOf('?') !== -1 ? '&' : '?';
+    return url + separator + getCacheBuster();
+  }
+
+  /**
+   * Helper: Statistical metrics calculator (min, max, avg, median, p95, stdev)
+   * @param {number[]} samples Array of numerical measurements
+   * @returns {Object} Calculated statistical summary
+   */
+  function calculateStatistics(samples) {
+    if (!samples || samples.length === 0) {
+      return { min: 0, max: 0, average: 0, median: 0, p95: 0, stdDev: 0, count: 0 };
+    }
+
+    const sorted = [...samples].sort((a, b) => a - b);
+    const count = sorted.length;
+    const sum = sorted.reduce((acc, val) => acc + val, 0);
+    const average = sum / count;
+
+    // Median
+    let median = 0;
+    const mid = Math.floor(count / 2);
+    if (count % 2 === 0) {
+      median = (sorted[mid - 1] + sorted[mid]) / 2;
+    } else {
+      median = sorted[mid];
+    }
+
+    // P95 (95th percentile)
+    const p95Index = Math.min(Math.floor(count * 0.95), count - 1);
+    const p95 = sorted[p95Index];
+
+    // Standard Deviation
+    const squareDiffs = sorted.map((value) => {
+      const diff = value - average;
+      return diff * diff;
+    });
+    const avgSquareDiff = squareDiffs.reduce((acc, val) => acc + val, 0) / count;
+    const stdDev = Math.sqrt(avgSquareDiff);
+
+    return {
+      min: parseFloat(sorted[0].toFixed(2)),
+      max: parseFloat(sorted[count - 1].toFixed(2)),
+      average: parseFloat(average.toFixed(2)),
+      median: parseFloat(median.toFixed(2)),
+      p95: parseFloat(p95.toFixed(2)),
+      stdDev: parseFloat(stdDev.toFixed(2)),
+      count
+    };
+  }
+
+  /**
+   * Measure single HTTP RTT with AbortController and performance.now()
+   * @param {string} url Target URL
+   * @param {number} timeoutMs Max timeout in milliseconds
+   * @param {string} [mode='cors'] Fetch mode ('cors' or 'no-cors')
+   * @returns {Promise<{duration: number, success: boolean, status: number, error: string|null}>}
+   */
+  async function measureSingleRTT(url, timeoutMs = 5000, mode = 'cors') {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const testUrl = appendQuery(url);
+    const startTime = performance.now();
+
+    try {
+      const response = await fetch(testUrl, {
+        method: 'GET',
+        mode: mode,
+        cache: 'no-store',
+        signal: controller.signal
+      });
+      const endTime = performance.now();
+      clearTimeout(timeoutId);
+
+      return {
+        duration: Math.max(0.5, endTime - startTime),
+        success: true,
+        status: response.status,
+        error: null
+      };
+    } catch (err) {
+      clearTimeout(timeoutId);
+      const endTime = performance.now();
+      const isAbort = err.name === 'AbortError';
+
+      return {
+        duration: Math.max(0.5, endTime - startTime),
+        success: false,
+        status: 0,
+        error: isAbort ? 'Request Timeout (' + timeoutMs + 'ms)' : err.message || 'Network Fetch Failed'
+      };
+    }
+  }
+
+  /**
+   * Measure Latency and Jitter across multiple samples
+   * Computes Jitter based on RFC 3550 statistical variance of successive RTTs
+   * @param {string} endpointUrl Target test endpoint
+   * @param {number} sampleCount Number of iterations (3, 5, 10, etc.)
+   * @param {function} [onProgress] Callback per sample completed (sampleIndex, result)
+   * @returns {Promise<Object>} Latency, jitter, failure rate, and raw samples
+   */
+  async function measureLatencyAndJitter(endpointUrl, sampleCount = 5, onProgress = null) {
+    const latencies = [];
+    const fullSamples = [];
+    let failedCount = 0;
+
+    for (let i = 0; i < sampleCount; i++) {
+      const sample = await measureSingleRTT(endpointUrl, CONFIG.timeout.latency, 'cors');
+      fullSamples.push(sample);
+
+      if (sample.success) {
+        latencies.push(sample.duration);
+      } else {
+        failedCount++;
+      }
+
+      if (typeof onProgress === 'function') {
+        onProgress(i + 1, sampleCount, sample);
+      }
+
+      // Small pause between samples to prevent queuing latency
+      if (i < sampleCount - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+      }
+    }
+
+    const stats = calculateStatistics(latencies);
+
+    // Calculate RFC 3550 Style Jitter: Average of absolute differences between consecutive samples
+    let jitter = 0;
+    if (latencies.length > 1) {
+      let diffSum = 0;
+      for (let j = 1; j < latencies.length; j++) {
+        diffSum += Math.abs(latencies[j] - latencies[j - 1]);
+      }
+      jitter = parseFloat((diffSum / (latencies.length - 1)).toFixed(2));
+    }
+
+    const failureRate = parseFloat(((failedCount / sampleCount) * 100).toFixed(1));
+
+    return {
+      stats,
+      jitter,
+      failureRate,
+      totalRequests: sampleCount,
+      successCount: latencies.length,
+      failedCount,
+      samples: fullSamples,
+      statusGrade: 'MEASURED'
+    };
+  }
+
+  /**
+   * Baseline Multi-Endpoint Check: Measures RTT against 3 independent Anycast CDNs
+   * Used as the objective baseline to compare against any specific target URL.
+   * @param {function} [onStep] Progress callback (stepName, percent)
+   * @returns {Promise<Object>} Aggregated baseline comparison metrics
+   */
+  async function measureBaselineNetwork(onStep = null) {
+    const results = [];
+    for (let i = 0; i < CONFIG.baselineEndpoints.length; i++) {
+      const ep = CONFIG.baselineEndpoints[i];
+      if (onStep) onStep(ep.name, Math.round(((i) / CONFIG.baselineEndpoints.length) * 100));
+      const res = await measureLatencyAndJitter(ep.url, 4);
+      results.push({
+        endpoint: ep,
+        metrics: res
+      });
+    }
+    if (onStep) onStep('Completed', 100);
+
+    // Aggregate valid medians
+    const allMedians = results.map(r => r.metrics.stats.median).filter(m => m > 0);
+    const allJitters = results.map(r => r.metrics.jitter).filter(j => j >= 0);
+    const aggStats = calculateStatistics(allMedians);
+    const avgJitter = allJitters.length > 0 ? parseFloat((allJitters.reduce((a, b) => a + b, 0) / allJitters.length).toFixed(2)) : 0;
+
+    return {
+      endpoints: results,
+      baselineLatency: aggStats.median,
+      baselineJitter: avgJitter,
+      baselineStats: aggStats,
+      statusGrade: 'MEASURED'
+    };
+  }
+
+  /**
+   * Real Download Speed Measurement
+   * Uses ReadableStream (or Blob fallback) to measure exact byte count and transfer time.
+   * @param {number} targetPayloadSizeMB 1, 5, 10, or 25 MB
+   * @param {function} [onProgress] Progress callback (bytesReceived, totalBytes, currentMbps)
+   * @returns {Promise<{mbps: number, totalBytes: number, durationSec: number, statusGrade: string}>}
+   */
+  async function measureDownloadSpeed(targetPayloadSizeMB = 5, onProgress = null) {
+    const targetEndpoint = CONFIG.downloadEndpoints.find(e => e.sizeMB === targetPayloadSizeMB) || CONFIG.downloadEndpoints[1];
+    const testUrl = appendQuery(targetEndpoint.url);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CONFIG.timeout.download);
+
+    const startTime = performance.now();
+    let receivedBytes = 0;
+
+    try {
+      const response = await fetch(testUrl, {
+        method: 'GET',
+        cache: 'no-store',
+        signal: controller.signal
+      });
+
+      if (!response.ok && response.status !== 0) {
+        throw new Error('Download endpoint responded with HTTP ' + response.status);
+      }
+
+      // Read stream for accurate dynamic speed monitoring
+      if (response.body && typeof response.body.getReader === 'function') {
+        const reader = response.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            receivedBytes += value.byteLength;
+            if (typeof onProgress === 'function') {
+              const currentElapsedSec = (performance.now() - startTime) / 1000;
+              const currentMbps = currentElapsedSec > 0 ? (receivedBytes * 8) / (currentElapsedSec * 1000000) : 0;
+              onProgress(receivedBytes, targetPayloadSizeMB * 1024 * 1024, parseFloat(currentMbps.toFixed(2)));
+            }
+          }
+        }
+      } else {
+        // Fallback for environments lacking ReadableStream reader
+        const buffer = await response.arrayBuffer();
+        receivedBytes = buffer.byteLength;
+      }
+
+      const endTime = performance.now();
+      clearTimeout(timeoutId);
+
+      const durationSec = Math.max(0.1, (endTime - startTime) / 1000);
+      const mbps = (receivedBytes * 8) / (durationSec * 1000000);
+
+      return {
+        mbps: parseFloat(mbps.toFixed(2)),
+        totalBytes: receivedBytes,
+        durationSec: parseFloat(durationSec.toFixed(2)),
+        statusGrade: 'MEASURED',
+        error: null
+      };
+    } catch (err) {
+      clearTimeout(timeoutId);
+      return {
+        mbps: 0,
+        totalBytes: receivedBytes,
+        durationSec: 0,
+        statusGrade: 'FAILED',
+        error: err.name === 'AbortError' ? 'Download timed out' : err.message || 'Download Failed'
+      };
+    }
+  }
+
+  /**
+   * Real Upload Speed Measurement
+   * CRITICAL: Strictly measures only if a valid uploadEndpoint is provided.
+   * Never fabricates upload speed from download speed or random algorithms.
+   * @param {number} sizeMB Size of binary payload to generate (e.g., 2MB)
+   * @param {function} [onProgress] Progress callback
+   * @returns {Promise<{mbps: number, bytesSent: number, durationSec: number, statusGrade: string, reason?: string}>}
+   */
+  async function measureUploadSpeed(sizeMB = 2, onProgress = null) {
+    if (!CONFIG.uploadEndpoint) {
+      return {
+        mbps: 0,
+        bytesSent: 0,
+        durationSec: 0,
+        statusGrade: 'UNAVAILABLE',
+        reason: 'Upload 데이터를 수신할 Remote Endpoint가 구성되지 않아 정확한 측정이 불가능합니다.'
+      };
+    }
+
+    const payloadSizeBytes = sizeMB * 1024 * 1024;
+    // Generate actual pseudo-random binary payload in memory
+    const payload = new Uint8Array(payloadSizeBytes);
+    for (let i = 0; i < 1024; i++) {
+      payload[i] = Math.floor(Math.random() * 256);
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CONFIG.timeout.upload);
+    const testUrl = appendQuery(CONFIG.uploadEndpoint);
+
+    const startTime = performance.now();
+    try {
+      const response = await fetch(testUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: payload,
+        cache: 'no-store',
+        signal: controller.signal
+      });
+
+      const endTime = performance.now();
+      clearTimeout(timeoutId);
+
+      const durationSec = Math.max(0.1, (endTime - startTime) / 1000);
+      const mbps = (payloadSizeBytes * 8) / (durationSec * 1000000);
+
+      return {
+        mbps: parseFloat(mbps.toFixed(2)),
+        bytesSent: payloadSizeBytes,
+        durationSec: parseFloat(durationSec.toFixed(2)),
+        statusGrade: 'MEASURED',
+        reason: null
+      };
+    } catch (err) {
+      clearTimeout(timeoutId);
+      return {
+        mbps: 0,
+        bytesSent: 0,
+        durationSec: 0,
+        statusGrade: 'FAILED',
+        reason: err.name === 'AbortError' ? 'Upload request timed out' : err.message || 'Upload transmission failed'
+      };
+    }
+  }
+
+  /**
+   * Normalizes arbitrary user URL input safely
+   * Adds https:// if omitted, rejects dangerous schemas (javascript:, data:, file:)
+   * @param {string} input 
+   * @returns {{valid: boolean, url: string, error?: string}}
+   */
+  function normalizeUrl(input) {
+    if (!input || typeof input !== 'string') {
+      return { valid: false, url: '', error: 'URL을 입력해주세요.' };
+    }
+
+    let trimmed = input.trim();
+
+    // Check dangerous schemes
+    const lower = trimmed.toLowerCase();
+    if (lower.startsWith('javascript:') || lower.startsWith('data:') || lower.startsWith('file:') || lower.startsWith('vbscript:')) {
+      return { valid: false, url: '', error: '보안상 허용되지 않는 URL 스킴입니다.' };
+    }
+
+    // Auto prepend https if protocol missing
+    if (!/^https?:\/\//i.test(trimmed)) {
+      trimmed = 'https://' + trimmed;
+    }
+
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return { valid: false, url: '', error: 'http:// 또는 https:// 프로토콜만 검사 가능합니다.' };
+      }
+      return { valid: true, url: parsed.href, hostname: parsed.hostname };
+    } catch (e) {
+      return { valid: false, url: '', error: '유효한 URL 형식이 아닙니다.' };
+    }
+  }
+
+  /**
+   * Deep Analysis of a Specific Website URL
+   * Combines Fetch Latency, ResourceTiming (DNS, TCP, TLS, TTFB), and CORS checks
+   * @param {string} targetUrl Normalized Target URL
+   * @param {number} repetitions Number of test samples (3, 5, 10)
+   * @param {function} [onProgress] Progress callback
+   * @returns {Promise<Object>} Comprehensive analysis result
+   */
+  async function testTargetWebsite(targetUrl, repetitions = 5, onProgress = null) {
+    const urlValidation = normalizeUrl(targetUrl);
+    if (!urlValidation.valid) {
+      throw new Error(urlValidation.error);
+    }
+    const cleanUrl = urlValidation.url;
+
+    // Track resource timing entries before & during test
+    const perfStartTime = performance.now();
+    const samples = [];
+    let corsRestricted = false;
+    let timingAllowed = false;
+    let timingData = null;
+
+    for (let i = 0; i < repetitions; i++) {
+      const sampleStartTime = performance.now();
+      const uniqueUrl = appendQuery(cleanUrl);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), CONFIG.timeout.targetTest);
+
+      let success = false;
+      let status = 0;
+      let duration = 0;
+      let error = null;
+      let isOpaque = false;
+
+      try {
+        // Attempt first with cors to obtain status code
+        const resp = await fetch(uniqueUrl, {
+          method: 'GET',
+          mode: 'cors',
+          cache: 'no-store',
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        duration = performance.now() - sampleStartTime;
+        status = resp.status;
+        success = true;
+      } catch (err) {
+        clearTimeout(timeoutId);
+        // If standard CORS fails, attempt mode: 'no-cors' to test actual network reachability
+        if (err.name !== 'AbortError') {
+          try {
+            const noCorsController = new AbortController();
+            const noCorsTimeout = setTimeout(() => noCorsController.abort(), 4000);
+            const noCorsStart = performance.now();
+            await fetch(uniqueUrl, {
+              method: 'GET',
+              mode: 'no-cors',
+              cache: 'no-store',
+              signal: noCorsController.signal
+            });
+            clearTimeout(noCorsTimeout);
+            duration = performance.now() - noCorsStart;
+            success = true;
+            corsRestricted = true;
+            isOpaque = true;
+            status = 0; // Opaque response
+          } catch (noCorsErr) {
+            duration = performance.now() - sampleStartTime;
+            success = false;
+            error = noCorsErr.name === 'AbortError' ? 'Timeout' : 'Connect Failed';
+          }
+        } else {
+          duration = performance.now() - sampleStartTime;
+          success = false;
+          error = 'Request Timeout';
+        }
+      }
+
+      samples.push({
+        iteration: i + 1,
+        duration: Math.max(1, duration),
+        success,
+        status,
+        isOpaque,
+        error
+      });
+
+      if (typeof onProgress === 'function') {
+        onProgress(i + 1, repetitions, samples[i]);
+      }
+
+      // Interval between requests to avoid DoS/flooding
+      if (i < repetitions - 1) {
+        await new Promise((r) => setTimeout(r, 150));
+      }
+    }
+
+    // Inspect PerformanceResourceTiming entries for the target
+    if (window.performance && typeof window.performance.getEntriesByType === 'function') {
+      const resourceEntries = window.performance.getEntriesByType('resource');
+      // Look for entries created after this test run matching the target hostname
+      const matchingEntries = resourceEntries.filter((entry) => {
+        return entry.startTime >= perfStartTime && entry.name.includes(urlValidation.hostname);
+      });
+
+      if (matchingEntries.length > 0) {
+        // Pick the latest entry
+        const latestEntry = matchingEntries[matchingEntries.length - 1];
+
+        // Check if Timing-Allow-Origin was permitted
+        // When TAO is restricted, DNS/TCP/TLS values are masked to 0 by the browser
+        const rawDns = latestEntry.domainLookupEnd - latestEntry.domainLookupStart;
+        const rawTcp = latestEntry.connectEnd - latestEntry.connectStart;
+        const rawTls = latestEntry.secureConnectionStart > 0 ? (latestEntry.connectEnd - latestEntry.secureConnectionStart) : 0;
+        const rawTtfb = latestEntry.responseStart > 0 ? (latestEntry.responseStart - latestEntry.requestStart) : 0;
+        const rawDownload = latestEntry.responseEnd > 0 && latestEntry.responseStart > 0 ? (latestEntry.responseEnd - latestEntry.responseStart) : 0;
+
+        if (rawDns > 0 || rawTcp > 0 || rawTls > 0 || rawTtfb > 0) {
+          timingAllowed = true;
+          timingData = {
+            dns: parseFloat(rawDns.toFixed(2)),
+            tcp: parseFloat(rawTcp.toFixed(2)),
+            tls: parseFloat(rawTls.toFixed(2)),
+            ttfb: parseFloat(rawTtfb.toFixed(2)),
+            download: parseFloat(rawDownload.toFixed(2)),
+            transferSize: latestEntry.transferSize,
+            encodedBodySize: latestEntry.encodedBodySize,
+            decodedBodySize: latestEntry.decodedBodySize,
+            statusGrade: 'MEASURED'
+          };
+        } else {
+          timingAllowed = false;
+          timingData = {
+            dns: null,
+            tcp: null,
+            tls: null,
+            ttfb: null,
+            download: null,
+            statusGrade: 'LIMITED',
+            reason: '대상 서버가 Timing-Allow-Origin 헤더를 허용하지 않아 브라우저 보안정책상 세부 네트워크 타이밍이 마스킹되었습니다.'
+          };
+        }
+      }
+    }
+
+    const successfulDurations = samples.filter(s => s.success).map(s => s.duration);
+    const stats = calculateStatistics(successfulDurations);
+    const failureCount = samples.filter(s => !s.success).length;
+    const failureRate = parseFloat(((failureCount / repetitions) * 100).toFixed(1));
+
+    // Fallback TTFB estimation from HTTP RTT median if TAO is restricted
+    const estimatedTtfb = timingData && timingData.ttfb !== null ? timingData.ttfb : stats.median;
+    const ttfbGrade = (timingData && timingData.ttfb !== null) ? 'MEASURED' : 'ESTIMATED';
+
+    return {
+      url: cleanUrl,
+      hostname: urlValidation.hostname,
+      stats,
+      failureRate,
+      totalRequests: repetitions,
+      successCount: successfulDurations.length,
+      failureCount,
+      corsRestricted,
+      timingAllowed,
+      timingData,
+      ttfb: estimatedTtfb,
+      ttfbGrade,
+      samples
+    };
+  }
+
+  /**
+   * Reads Browser Network Information API (if supported)
+   * strictly labeled as ESTIMATED
+   */
+  function getBrowserNetworkInfo() {
+    const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (!conn) {
+      return {
+        supported: false,
+        effectiveType: 'UNSUPPORTED',
+        downlink: null,
+        rtt: null,
+        saveData: false,
+        statusGrade: 'UNAVAILABLE',
+        note: '이 브라우저는 Network Information API를 지원하지 않습니다.'
+      };
+    }
+
+    return {
+      supported: true,
+      effectiveType: conn.effectiveType || 'unknown',
+      downlink: conn.downlink ? conn.downlink + ' Mbps' : 'N/A',
+      rtt: conn.rtt ? conn.rtt + ' ms' : 'N/A',
+      saveData: conn.saveData || false,
+      statusGrade: 'ESTIMATED',
+      note: 'Network Information API 제공값 (실시간 실측 속도가 아닌 브라우저 추정치)'
+    };
+  }
+
+  // Export to Global
+  window.NQA_Network = {
+    CONFIG,
+    calculateStatistics,
+    measureSingleRTT,
+    measureLatencyAndJitter,
+    measureBaselineNetwork,
+    measureDownloadSpeed,
+    measureUploadSpeed,
+    normalizeUrl,
+    testTargetWebsite,
+    getBrowserNetworkInfo
+  };
+
+})(window);
